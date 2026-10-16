@@ -21,6 +21,12 @@ import (
 
 const defaultIndexingTimeout = 1*time.Hour + 30*time.Minute
 
+// errAttemptStale is returned when an indexing attempt was superseded by
+// newer configuration before one of its stages could commit. Such an attempt
+// must not publish a shard or report status; its caller treats it as neither
+// success nor failure.
+var errAttemptStale = errors.New("indexing attempt superseded by newer configuration")
+
 // IndexOptions are the options that Sourcegraph can set via it's search
 // configuration endpoint.
 type IndexOptions struct {
@@ -95,6 +101,11 @@ type indexArgs struct {
 
 	// ShardMerging is true if we want zoekt-git-index to respect compound shards.
 	ShardMerging bool
+
+	// Attempt pins the configuration generation and identity of the queue
+	// job that produced these args. A nil attempt marks an ad-hoc invocation
+	// (manual force reindex) which is always considered valid.
+	Attempt *indexAttempt
 }
 
 // BuildOptions returns a index.Options represented by indexArgs. Note: it
@@ -169,6 +180,18 @@ type gitIndexConfig struct {
 
 	// timeout defines how long the index server waits before killing an indexing job.
 	timeout time.Duration
+
+	// stillValid, when non-nil, is consulted at the commit points between
+	// stages: before pulling, and again after the fetch before the index
+	// subprocess publishes shards. A false result aborts the attempt with
+	// errAttemptStale. A nil function means the attempt is always valid.
+	stillValid func() bool
+}
+
+// valid reports whether the attempt owning this configuration may still
+// commit its next stage.
+func (c gitIndexConfig) valid() bool {
+	return c.stillValid == nil || c.stillValid()
 }
 
 func gitIndex(ctx context.Context, c gitIndexConfig, o *indexArgs, sourcegraph Sourcegraph, l sglog.Logger) error {
@@ -189,7 +212,18 @@ func gitIndex(ctx context.Context, c gitIndexConfig, o *indexArgs, sourcegraph S
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
+	// Commit point: do not even pull for an attempt that newer configuration
+	// has superseded.
+	if !c.valid() {
+		return errAttemptStale
+	}
+
 	return gitCache.withFetchedRepo(ctx, c, o, logger, func(gitDir string) error {
+		// Commit point: the fetch is done and the index subprocess is about to
+		// publish shards. A superseded attempt must not publish.
+		if !c.valid() {
+			return errAttemptStale
+		}
 		if err := setZoektConfig(ctx, gitDir, o, c); err != nil {
 			return err
 		}

@@ -235,8 +235,9 @@ func requireGitDaemon(t *testing.T) {
 }
 
 type recordingSourcegraph struct {
-	opts    IndexOptions
-	updates [][]indexStatus
+	opts      IndexOptions
+	updates   [][]indexStatus
+	updateErr error
 }
 
 func (s *recordingSourcegraph) List(ctx context.Context, indexed []uint32) (*SourcegraphListResult, error) {
@@ -256,7 +257,7 @@ func (s *recordingSourcegraph) UpdateIndexStatus(repositories []indexStatus) err
 	cp := make([]indexStatus, len(repositories))
 	copy(cp, repositories)
 	s.updates = append(s.updates, cp)
-	return nil
+	return s.updateErr
 }
 
 type gitFetchFixture struct {

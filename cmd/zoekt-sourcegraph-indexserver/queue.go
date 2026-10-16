@@ -35,11 +35,50 @@ type queueItem struct {
 	// seq is a sequence number used as a tiebreaker. This is to ensure we
 	// act like a FIFO queue.
 	seq int64
+	// gen is the configuration generation of item.opts. It is incremented
+	// every time opts are replaced with different options. Attempts pin the
+	// generation they dequeued and may only commit their result while it is
+	// still the current generation.
+	gen int64
 	// dateAddedToQueue is the time when this indexing job was added to the queue. If this item is no longer
 	// in the heap (i.e. it has been processed already), this value is nonsensical.
 	dateAddedToQueue time.Time
 	// backoff will handle backing off of future indexing requests for a duration of time based on previous failures
 	backoff backoff
+}
+
+// indexAttempt is an immutable token pinning the IndexOptions (including the
+// branch commits) dequeued for one concrete indexing attempt. It deliberately
+// contains no locks or queue pointer so it stays comparable; validity is
+// checked through Queue.attemptValid. Pulling, indexing, shard publishing and
+// status reports may only commit their result for the attempt while it is
+// valid.
+type indexAttempt struct {
+	repoID uint32
+	// id uniquely identifies one dequeue within this process.
+	id int64
+	// gen is the configuration generation pinned at dequeue.
+	gen int64
+	// opts are the options pinned at dequeue.
+	opts IndexOptions
+	// dateAddedToQueue is the time the pinned job entered the queue.
+	dateAddedToQueue time.Time
+}
+
+// ID returns the attempt's unique identifier.
+func (a *indexAttempt) ID() int64 { return a.id }
+
+// attemptValid reports whether a still represents the newest known
+// configuration generation for its repository. A nil attempt marks an ad-hoc
+// invocation (manual force reindex) and is always valid.
+func (q *Queue) attemptValid(a *indexAttempt) bool {
+	if a == nil {
+		return true
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	item := q.items[a.repoID]
+	return item != nil && item.gen == a.gen
 }
 
 // Queue is a priority queue which returns the next repo to index. It is safe
@@ -53,8 +92,13 @@ type Queue struct {
 	items        map[uint32]*queueItem
 	pq           pqueue
 	seq          int64
+	attemptSeq   int64
 	logger       sglog.Logger
 	newQueueItem func(uint32) *queueItem
+	// onRemove, if set, is invoked without the queue mutex held after a queue
+	// item is removed for good (e.g. when its repository is no longer
+	// assigned to this instance).
+	onRemove func(repoID uint32)
 }
 
 func NewQueue(backoffDuration, maxBackoffDuration time.Duration, l sglog.Logger) *Queue {
@@ -87,6 +131,10 @@ type QueueItem struct {
 	Opts IndexOptions
 	// DateAddedToQueue is the time when this indexing job was added to the queue, used for telemetry.
 	DateAddedToQueue time.Time
+	// attempt is the token pinning Opts and the configuration generation at
+	// dequeue. It is used to reject stale results after newer configuration
+	// arrived while the job was running.
+	attempt *indexAttempt
 }
 
 // Pop returns options and metadata for the next repo to index. If the queue is empty ok is false.
@@ -105,9 +153,18 @@ func (q *Queue) Pop() (result QueueItem, ok bool) {
 	dateAdded := item.dateAddedToQueue
 	item.dateAddedToQueue = time.Unix(0, 0)
 
+	q.attemptSeq++
+	attempt := &indexAttempt{
+		repoID:           item.repoID,
+		id:               q.attemptSeq,
+		gen:              item.gen,
+		opts:             item.opts,
+		dateAddedToQueue: dateAdded,
+	}
+
 	q.mu.Unlock()
 
-	return QueueItem{item.opts, dateAdded}, true
+	return QueueItem{Opts: item.opts, DateAddedToQueue: dateAdded, attempt: attempt}, true
 }
 
 // Len returns the number of items in the queue.
@@ -131,6 +188,9 @@ func (q *Queue) AddOrUpdate(opts IndexOptions) {
 			item.seq = q.seq
 			item.dateAddedToQueue = time.Now()
 		}
+		// New configuration supersedes any attempt that pinned the previous
+		// generation, including an attempt that is currently running.
+		item.gen++
 		item.indexed = false
 		item.opts = opts
 	}
@@ -307,6 +367,72 @@ func (q *Queue) SetIndexed(opts IndexOptions, state indexState) {
 	q.mu.Unlock()
 }
 
+// Complete records the result of an attempt. It is a no-op when the attempt
+// has been superseded by newer configuration or its repository is no longer
+// tracked; in that case it returns false and neither queue state nor backoff
+// is modified, so a late result can never overwrite a newer queued state.
+func (q *Queue) Complete(a *indexAttempt, state indexState) bool {
+	if a == nil {
+		return false
+	}
+
+	q.mu.Lock()
+	item := q.items[a.repoID]
+	if item == nil || item.gen != a.gen {
+		q.mu.Unlock()
+		return false
+	}
+
+	item.indexState = state
+	if state != indexStateFail {
+		// gen only changes when opts change, so a matching generation means
+		// the attempt's pinned opts are the current opts.
+		item.indexed = true
+		item.backoff.Reset()
+
+		if item.heapIdx >= 0 {
+			// We only update the position in the queue, never add it.
+			heap.Fix(&q.pq, item.heapIdx)
+		}
+	} else {
+		item.backoff.Fail(time.Now(), q.logger, item.opts)
+
+		if item.heapIdx >= 0 {
+			// Remove from queue
+			heap.Remove(&q.pq, item.heapIdx)
+			item.heapIdx = -1
+		}
+	}
+	q.mu.Unlock()
+
+	return true
+}
+
+// Recover registers unconfirmed work found in a persistent attempt record
+// while the process was down. The item is enqueued unconditionally (the
+// in-memory backoff is empty after a restart) so an unconfirmed status report
+// is reconciled promptly. AddOrUpdate replaces the options if the first
+// configuration sync shows newer configuration.
+func (q *Queue) Recover(opts IndexOptions) {
+	q.mu.Lock()
+	item := q.getOrAdd(opts.RepoID)
+	item.indexed = false
+	item.opts = opts
+
+	if item.heapIdx < 0 {
+		q.seq++
+		item.seq = q.seq
+		item.dateAddedToQueue = time.Now()
+
+		heap.Push(&q.pq, item)
+		metricQueueLen.Set(float64(len(q.pq)))
+		metricQueueCap.Set(float64(len(q.items)))
+	} else {
+		heap.Fix(&q.pq, item.heapIdx)
+	}
+	q.mu.Unlock()
+}
+
 // MaybeRemoveMissing will remove all queue items not in ids and return the
 // ids of items removed from the queue. It will heuristically not run to
 // conserve resources.
@@ -333,7 +459,6 @@ func (q *Queue) MaybeRemoveMissing(ids []uint32) []uint32 {
 	}
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
 
 	var removed []uint32
 	for _, item := range q.items {
@@ -354,6 +479,16 @@ func (q *Queue) MaybeRemoveMissing(ids []uint32) []uint32 {
 
 	metricQueueLen.Set(float64(len(q.pq)))
 	metricQueueCap.Set(float64(len(q.items)))
+
+	q.mu.Unlock()
+
+	// Remove any persistent attempt record after releasing the queue mutex;
+	// the hook must never call back into the queue.
+	if q.onRemove != nil {
+		for _, id := range removed {
+			q.onRemove(id)
+		}
+	}
 
 	return removed
 }

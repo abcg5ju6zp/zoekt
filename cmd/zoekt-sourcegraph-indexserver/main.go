@@ -184,6 +184,7 @@ const (
 	indexStateSuccessMeta indexState = "success_meta" // We only updated metadata
 	indexStateNoop        indexState = "noop"         // We didn't need to update index
 	indexStateEmpty       indexState = "empty"        // index is empty (empty repo)
+	indexStateStale       indexState = "stale"        // attempt superseded by newer configuration
 )
 
 // Server is the main functionality of zoekt-sourcegraph-indexserver. It
@@ -239,6 +240,20 @@ type Server struct {
 
 	// timeout defines how long the index server waits before killing an indexing job.
 	timeout time.Duration
+
+	// attempts persists per-repository indexing attempts so unconfirmed work
+	// survives status-report failures and process restarts.
+	attempts   *attemptStore
+	attemptsMu sync.Mutex
+
+	// runCmdOverride overrides execution of external commands when set.
+	// Hermetic index-pipeline tests use this to avoid spawning git and
+	// zoekt-git-index subprocesses.
+	runCmdOverride func(cmd *exec.Cmd) error
+
+	// metadataOverride overrides on-disk repository metadata discovery when
+	// set. Hermetic index-pipeline tests use this to simulate shard state.
+	metadataOverride func(args *indexArgs) (repository *zoekt.Repository, metadata *zoekt.IndexMetadata, ok bool, err error)
 
 	indexserverv1.UnimplementedSourcegraphIndexserverServiceServer
 }
@@ -383,6 +398,10 @@ func isIndexingPaused(indexDir string) (bool, string) {
 func (s *Server) Run() {
 	removeStaleShardFiles(s.IndexDir)
 
+	// Take over unconfirmed work persisted by earlier attempts (interrupted
+	// builds and status reports that never got their confirmation).
+	s.recoverAttempts()
+
 	// Start a goroutine which updates the queue with commits to index.
 	go func() {
 		// We update the list of indexed repos every Interval. To speed up manual
@@ -494,6 +513,9 @@ func (s *Server) processQueue() {
 
 		opts := item.Opts
 		args := s.indexArgs(opts)
+		// Pin the attempt token minted at dequeue so pull, shard publish and
+		// status reports only commit while its configuration is still current.
+		args.Attempt = item.attempt
 
 		ran := s.muIndexDir.With(opts.Name, opts.RepoID, func() {
 			// only record time taken once we hold the lock. This avoids us
@@ -528,8 +550,15 @@ func (s *Server) processQueue() {
 				)
 			case indexStateSuccessMeta:
 				infoLog.Printf("updated meta %s in %v", args.String(), elapsed)
+			case indexStateStale:
+				debugLog.Printf("index attempt superseded by newer configuration: %s", args.String())
 			}
-			s.queue.SetIndexed(opts, state)
+
+			// A stale result is dropped entirely; it can neither mark the
+			// newer queued configuration indexed nor back it off.
+			if !s.queue.Complete(args.Attempt, state) {
+				debugLog.Printf("dropped result of superseded index attempt: %s state=%s", args.String(), state)
+			}
 		})
 
 		if !ran {
@@ -633,6 +662,12 @@ func (s *Server) index(ctx context.Context, args *indexArgs) (state indexState, 
 	tr.LazyPrintf("branches: %v", args.Branches)
 
 	if len(args.Branches) == 0 {
+		// Any record from a prior configuration with branches is obsolete now
+		// that the repository has no branches. Empty-shard handling itself is
+		// unchanged.
+		if store := s.attemptStoreFor(); store != nil {
+			_ = store.Delete(args.RepoID)
+		}
 		return indexStateEmpty, createEmptyShard(args)
 	}
 
@@ -647,6 +682,47 @@ func (s *Server) index(ctx context.Context, args *indexArgs) (state indexState, 
 	if _, ok := s.repositoriesSkipSymbolsCalculationAllowList[repositoryName]; ok {
 		tr.LazyPrintf("skipping symbols calculation")
 		args.Symbols = false
+	}
+
+	runCmd := func(cmd *exec.Cmd) error {
+		return s.loggedRun(tr, cmd)
+	}
+	if s.runCmdOverride != nil {
+		runCmd = s.runCmdOverride
+	}
+
+	findRepositoryMetadata := func(args *indexArgs) (repository *zoekt.Repository, metadata *zoekt.IndexMetadata, ok bool, err error) {
+		return args.BuildOptions().FindRepositoryMetadata()
+	}
+	if s.metadataOverride != nil {
+		findRepositoryMetadata = s.metadataOverride
+	}
+
+	c := gitIndexConfig{
+		runCmd:                 runCmd,
+		findRepositoryMetadata: findRepositoryMetadata,
+		timeout:                s.timeout,
+		stillValid:             func() bool { return s.attemptValid(args.Attempt) },
+	}
+
+	logIndexStatusUpdateError := func(err error) {
+		s.logger.Error("failed to update index status",
+			sglog.String("repo", args.Name),
+			sglog.Uint32("id", args.RepoID),
+			sglogBranches("branches", args.Branches),
+			sglog.Error(err),
+		)
+	}
+
+	// Take over persisted, unconfirmed work before doing anything new. This
+	// reconciles against the shard on disk and only resends status reports;
+	// it never rebuilds a version already on disk. A manual force reindex has
+	// no queue token and always runs the requested fresh build, bypassing the
+	// takeover.
+	if args.Attempt != nil {
+		if state, handled, recErr := s.reconcileAttempt(c, args); handled {
+			return state, recErr
+		}
 	}
 
 	reason := "forced"
@@ -681,39 +757,266 @@ func (s *Server) index(ctx context.Context, args *indexArgs) (state indexState, 
 	infoLog.Printf("updating index %s reason=%s", args.String(), reason)
 
 	metricIndexingTotal.Inc()
-	c := gitIndexConfig{
-		runCmd: func(cmd *exec.Cmd) error {
-			return s.loggedRun(tr, cmd)
-		},
 
-		findRepositoryMetadata: func(args *indexArgs) (repository *zoekt.Repository, metadata *zoekt.IndexMetadata, ok bool, err error) {
-			return args.BuildOptions().FindRepositoryMetadata()
-		},
-		timeout: s.timeout,
+	// Commit point: newer configuration may have arrived while waiting for the
+	// repository lock or an earlier configuration sync.
+	if !s.attemptValid(args.Attempt) {
+		return indexStateStale, nil
 	}
 
-	logIndexStatusUpdateError := func(err error) {
-		s.logger.Error("failed to update index status",
+	// Record that an index build is in flight so a crash can be taken over.
+	s.persistAttempt(args, &persistedAttempt{
+		RepoID:    args.RepoID,
+		AttemptID: attemptIDOf(args),
+		Stage:     stageIndexing,
+		Options:   args.IndexOptions,
+	})
+
+	err = gitIndex(ctx, c, args, s.Sourcegraph, s.logger)
+	if err != nil {
+		// A superseded attempt neither fails nor succeeds and never reports.
+		if errors.Is(err, errAttemptStale) || !s.attemptValid(args.Attempt) {
+			debugLog.Printf("discarding result of superseded index attempt: %s", args.String())
+			s.discardAttempt(args)
+			return indexStateStale, nil
+		}
+
+		// Safety net for a lost success response at the process boundary: if
+		// the shard matching the pinned branch commits is already on disk, a
+		// non-zero subprocess exit must not be reported as failure and the
+		// version must not be rebuilt.
+		if repo, metadata, ok, mErr := c.findRepositoryMetadata(args); mErr == nil && ok && repo != nil && branchesEqual(args.Branches, repo.Branches) {
+			tr.LazyPrintf("index subprocess failed but shard matches pinned commits; confirming success")
+			return s.reportPublishedSuccess(c, args, metadata.IndexTime.Unix())
+		}
+
+		// Persist the failure-report stage: a retry resends the failure
+		// without rerunning the build.
+		s.persistAttempt(args, &persistedAttempt{
+			RepoID:         args.RepoID,
+			AttemptID:      attemptIDOf(args),
+			Stage:          stageReportFailure,
+			Options:        args.IndexOptions,
+			FailureMessage: truncateFailureMessageForSourcegraph(err.Error()),
+		})
+
+		if statusErr := updateIndexStatusOnSourcegraph(c, args, s.Sourcegraph, err); statusErr != nil {
+			logIndexStatusUpdateError(statusErr)
+		} else {
+			s.discardAttempt(args)
+		}
+		return indexStateFail, err
+	}
+
+	// Commit point: the shard is published, but only a still-current attempt
+	// may announce these branch commits as the latest version.
+	if !s.attemptValid(args.Attempt) {
+		debugLog.Printf("discarding success of superseded index attempt: %s", args.String())
+		s.discardAttempt(args)
+		return indexStateStale, nil
+	}
+
+	var indexTimeUnix int64
+	if _, metadata, ok, mErr := c.findRepositoryMetadata(args); mErr != nil {
+		logIndexStatusUpdateError(fmt.Errorf("failed to read metadata for new/updated index: %w", mErr))
+	} else if !ok {
+		logIndexStatusUpdateError(errors.New("failed to find metadata for new/updated index"))
+	} else {
+		indexTimeUnix = metadata.IndexTime.Unix()
+	}
+
+	return s.reportPublishedSuccess(c, args, indexTimeUnix)
+}
+
+// reconcileAttempt resumes unconfirmed work found in a persisted attempt
+// record. It returns handled=true when the record reached a terminal state
+// through reconciliation (a resent success/failure report, including an
+// upgrade from recorded failure to the shard found on disk). When handled is
+// false the record did not resolve and the caller runs a normal index pass,
+// which still honors IncrementalSkipIndexing, forced rebuilds and backoff.
+func (s *Server) reconcileAttempt(c gitIndexConfig, args *indexArgs) (state indexState, handled bool, err error) {
+	store := s.attemptStoreFor()
+	if store == nil {
+		return "", false, nil
+	}
+
+	rec, loadErr := store.Load(args.RepoID)
+	if loadErr != nil {
+		s.logger.Error("failed to load index attempt record",
+			sglog.String("repo", args.Name),
+			sglog.Uint32("id", args.RepoID),
+			sglog.Error(loadErr),
+		)
+		return "", false, nil
+	}
+	if rec == nil {
+		return "", false, nil
+	}
+
+	// The record pins one configuration. If configuration moved on, the old
+	// result must never be announced as the latest version.
+	if rec.Options.Name != args.Name || !branchesEqual(rec.Options.Branches, args.Branches) {
+		debugLog.Printf("discarding attempt record for superseded configuration: %s", args.String())
+		_ = store.Delete(args.RepoID)
+		return "", false, nil
+	}
+
+	repo, metadata, ok, mErr := c.findRepositoryMetadata(args)
+	diskMatches := mErr == nil && ok && repo != nil && branchesEqual(args.Branches, repo.Branches)
+
+	switch rec.Stage {
+	case stageReportSuccess, stageIndexing:
+		if diskMatches {
+			state, err = s.reportPublishedSuccess(c, args, metadata.IndexTime.Unix())
+			return state, true, err
+		}
+		// The shard is not on disk (interrupted build, or cleanup removed an
+		// unconfirmed shard): fall through to the normal build. The build
+		// path overwrites the record with the current attempt identity.
+		debugLog.Printf("taking over unfinished index attempt (stage=%s): %s", rec.Stage, args.String())
+		return "", false, nil
+
+	case stageReportFailure:
+		if diskMatches {
+			// The wanted shard exists despite the recorded failure (the
+			// failure/success response was lost): upgrade instead of
+			// re-reporting failure.
+			state, err = s.reportPublishedSuccess(c, args, metadata.IndexTime.Unix())
+			return state, true, err
+		}
+
+		// Resend just the failure report. The build itself is not rerun.
+		failureMessage := rec.FailureMessage
+		if failureMessage == "" {
+			failureMessage = "indexing failed before the status report was confirmed"
+		}
+		indexErr := errors.New(failureMessage)
+		if statusErr := updateIndexStatusOnSourcegraph(c, args, s.Sourcegraph, indexErr); statusErr != nil {
+			// Keep the record: the next dequeue retries only this report.
+			s.logger.Error("failed to resend index failure status",
+				sglog.String("repo", args.Name),
+				sglog.Uint32("id", args.RepoID),
+				sglog.Error(statusErr),
+			)
+		} else {
+			if err := store.Delete(args.RepoID); err != nil {
+				s.logger.Error("failed to remove confirmed attempt record", sglog.Error(err))
+			}
+		}
+		return indexStateFail, true, indexErr
+	}
+
+	return "", false, nil
+}
+
+// reportPublishedSuccess records the unconfirmed-success stage for the shard
+// already present on disk, sends the success status report, and removes the
+// record once Sourcegraph confirms. It never downgrades an indexed shard to
+// failure: a failed report is retried from the persisted stage without
+// rebuilding or republishing the same version.
+func (s *Server) reportPublishedSuccess(c gitIndexConfig, args *indexArgs, indexTimeUnix int64) (indexState, error) {
+	s.persistAttempt(args, &persistedAttempt{
+		RepoID:        args.RepoID,
+		AttemptID:     attemptIDOf(args),
+		Stage:         stageReportSuccess,
+		Options:       args.IndexOptions,
+		IndexTimeUnix: indexTimeUnix,
+	})
+
+	if err := updateIndexStatusOnSourcegraph(c, args, s.Sourcegraph, nil); err != nil {
+		s.logger.Error("failed to confirm indexed shard; will retry from attempt record",
 			sglog.String("repo", args.Name),
 			sglog.Uint32("id", args.RepoID),
 			sglogBranches("branches", args.Branches),
 			sglog.Error(err),
 		)
+		return indexStateSuccess, nil
 	}
 
-	err = gitIndex(ctx, c, args, s.Sourcegraph, s.logger)
-	if err != nil {
-		if statusErr := updateIndexStatusOnSourcegraph(c, args, s.Sourcegraph, err); statusErr != nil {
-			logIndexStatusUpdateError(statusErr)
-		}
-		return indexStateFail, err
-	}
-
-	if err := updateIndexStatusOnSourcegraph(c, args, s.Sourcegraph, nil); err != nil {
-		logIndexStatusUpdateError(err)
-	}
-
+	s.discardAttempt(args)
 	return indexStateSuccess, nil
+}
+
+// attemptIDOf returns the identity of the attempt owning args. Ad-hoc
+// invocations (manual force reindex) use 0.
+func attemptIDOf(args *indexArgs) int64 {
+	if args.Attempt != nil {
+		return args.Attempt.ID()
+	}
+	return 0
+}
+
+// attemptValid reports whether attempt may still commit its stages. A nil
+// attempt (manual force reindex) is always valid; so is a server without a
+// queue in hermetic tests.
+func (s *Server) attemptValid(a *indexAttempt) bool {
+	if a == nil || s.queue == nil {
+		return true
+	}
+	return s.queue.attemptValid(a)
+}
+
+// attemptStoreFor returns the process-wide attempt store, creating it lazily
+// so Server literals in tests keep working.
+func (s *Server) attemptStoreFor() *attemptStore {
+	s.attemptsMu.Lock()
+	defer s.attemptsMu.Unlock()
+	if s.attempts == nil {
+		s.attempts = newAttemptStore(s.IndexDir)
+	}
+	return s.attempts
+}
+
+// persistAttempt writes rec for args, logging write errors without failing
+// the index job: disk shards and the next configuration sync still converge.
+func (s *Server) persistAttempt(args *indexArgs, rec *persistedAttempt) {
+	if err := s.attemptStoreFor().Save(rec); err != nil {
+		s.logger.Error("failed to persist index attempt",
+			sglog.String("repo", args.Name),
+			sglog.Uint32("id", args.RepoID),
+			sglog.String("stage", string(rec.Stage)),
+			sglog.Error(err),
+		)
+	}
+}
+
+// discardAttempt removes the record for args only while it still belongs to
+// the same attempt, so a stale attempt never deletes a newer attempt's record.
+func (s *Server) discardAttempt(args *indexArgs) {
+	if err := s.attemptStoreFor().DeleteIfMatch(args.RepoID, attemptIDOf(args)); err != nil {
+		s.logger.Error("failed to remove index attempt record",
+			sglog.String("repo", args.Name),
+			sglog.Uint32("id", args.RepoID),
+			sglog.Error(err),
+		)
+	}
+}
+
+// recoverAttempts re-enqueues unconfirmed work found in persistent attempt
+// records after a restart. Records for repositories no longer assigned to
+// this instance are dropped on the first configuration sync via
+// MaybeRemoveMissing.
+func (s *Server) recoverAttempts() {
+	store := s.attemptStoreFor()
+	records, err := store.List()
+	if err != nil {
+		s.logger.Error("failed to list index attempt records", sglog.Error(err))
+		return
+	}
+
+	for _, rec := range records {
+		if rec.RepoID == 0 || rec.Options.RepoID != rec.RepoID {
+			if err := store.Delete(rec.RepoID); err != nil {
+				s.logger.Error("failed to remove invalid attempt record", sglog.Error(err))
+			}
+			continue
+		}
+		s.logger.Info("recovering unconfirmed index attempt",
+			sglog.Uint32("id", rec.RepoID),
+			sglog.String("stage", string(rec.Stage)),
+		)
+		s.queue.Recover(rec.Options)
+	}
 }
 
 // updateIndexStatusOnSourcegraph pushes the current state to sourcegraph so
@@ -1208,6 +1511,9 @@ func (s *Server) DeleteAllData(ctx context.Context, _ *indexserverv1.DeleteAllDa
 		if err := gitCache.removeTenant(tnt.ID()); err != nil {
 			merr = multierr.Append(merr, err)
 		}
+		if err := s.attemptStoreFor().DeleteTenant(tnt.ID()); err != nil {
+			merr = multierr.Append(merr, err)
+		}
 	})
 
 	return &indexserverv1.DeleteAllDataResponse{}, merr
@@ -1658,6 +1964,16 @@ func newServer(conf rootConfig) (*Server, error) {
 
 	q := NewQueue(conf.backoffDuration, conf.maxBackoffDuration, logger)
 
+	attempts := newAttemptStore(conf.index)
+	q.onRemove = func(repoID uint32) {
+		if err := attempts.Delete(repoID); err != nil {
+			logger.Error("failed to remove index attempt record",
+				sglog.Uint32("repo_id", repoID),
+				sglog.Error(err),
+			)
+		}
+	}
+
 	return &Server{
 		logger:                            logger,
 		rootURL:                           rootURL,
@@ -1681,6 +1997,7 @@ func newServer(conf rootConfig) (*Server, error) {
 		},
 		timeout:        indexingTimeout,
 		indexSemaphore: make(chan struct{}, int(conf.indexConcurrency)),
+		attempts:       attempts,
 	}, err
 }
 
