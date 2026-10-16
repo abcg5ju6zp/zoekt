@@ -538,6 +538,13 @@ type SearchResult struct {
 	// FragmentNames holds a repo => template string map, for
 	// the line number fragment.
 	LineFragments map[string]string
+
+	// ResumeToken is an opaque credential that confirms every batch of a
+	// resumable StreamSearch sent up to and including the event it is
+	// attached to. It is only populated on StreamSearch events at safe batch
+	// boundaries. The field is not part of the JSON/HTTP API and does not
+	// count towards SizeBytes.
+	ResumeToken []byte `json:"-"`
 }
 
 // SizeBytes is a best-effort estimate of the size of SearchResult in memory.
@@ -1121,4 +1128,103 @@ func (f SenderFunc) Send(result *SearchResult) {
 type Streamer interface {
 	Searcher
 	StreamSearch(ctx context.Context, q query.Q, opts *SearchOptions, sender Sender) (err error)
+}
+
+// StreamResumeRequest is a resumable StreamSearch request. A zero value
+// (empty Token) starts a fresh resumable stream and fixes the query snapshot;
+// a non-empty Token reconnects to an existing snapshot and resumes from the
+// last batch confirmed by the token.
+type StreamResumeRequest struct {
+	// Token is the opaque credential returned with a previous result batch.
+	Token []byte
+
+	// Abandon, together with a non-empty Token, releases the identified
+	// snapshot instead of resuming it. No search runs in that case.
+	Abandon bool
+}
+
+// StreamResumeErrorCode classifies why a resumable stream could not be
+// continued. The codes are mapped 1:1 to the gRPC StreamResumeError enum.
+type StreamResumeErrorCode int
+
+const (
+	// StreamResumeInvalidToken: the credential is malformed, corrupt,
+	// forged, or its authentication tag does not verify.
+	StreamResumeInvalidToken StreamResumeErrorCode = iota + 1
+	// StreamResumeMismatch: the credential is valid but the echoed query,
+	// SearchOptions, or tenant do not match the snapshot.
+	StreamResumeMismatch
+	// StreamResumeExpired: the snapshot has passed its expiration time.
+	StreamResumeExpired
+	// StreamResumeRestarted: the credential was produced by another server
+	// process (e.g. after a restart) or references an unknown snapshot.
+	StreamResumeRestarted
+	// StreamResumeCompleted: the snapshot already streamed the full result.
+	StreamResumeCompleted
+	// StreamResumeAbandoned: the snapshot was explicitly abandoned.
+	StreamResumeAbandoned
+)
+
+// StreamResumeError is returned by a resumable stream when the request cannot
+// be honored as a resume. It describes a terminal, non-resumable outcome: the
+// caller must start a new search itself; the server never silently replaced
+// the resume with a new search.
+type StreamResumeError struct {
+	Code StreamResumeErrorCode
+	msg  string
+}
+
+// NewStreamResumeError returns a StreamResumeError with the given code and a
+// human-readable message.
+func NewStreamResumeError(code StreamResumeErrorCode, msg string) *StreamResumeError {
+	return &StreamResumeError{Code: code, msg: msg}
+}
+
+func (e *StreamResumeError) Error() string {
+	if e == nil {
+		return "resume error"
+	}
+	if e.msg != "" {
+		return "stream search cannot be resumed (" + e.Code.String() + "): " + e.msg
+	}
+	return "stream search cannot be resumed: " + e.Code.String()
+}
+
+// String returns a stable identifier for the error code.
+func (c StreamResumeErrorCode) String() string {
+	switch c {
+	case StreamResumeInvalidToken:
+		return "invalid_token"
+	case StreamResumeMismatch:
+		return "mismatch"
+	case StreamResumeExpired:
+		return "expired"
+	case StreamResumeRestarted:
+		return "restarted"
+	case StreamResumeCompleted:
+		return "completed"
+	case StreamResumeAbandoned:
+		return "abandoned"
+	default:
+		return "unknown"
+	}
+}
+
+// ResumableStreamer is a Streamer that can pin a query snapshot and resume an
+// interrupted StreamSearch from a previously confirmed batch.
+//
+// StreamSearchResume with an empty Token starts a new resumable stream. With a
+// non-empty Token it validates the credential against the echoed query,
+// options and tenant, then either resumes the stream, releases the snapshot
+// (req.Abandon, abandoned return value is true), or returns a
+// *StreamResumeError without performing a search.
+type ResumableStreamer interface {
+	Streamer
+	StreamSearchResume(
+		ctx context.Context,
+		q query.Q,
+		opts *SearchOptions,
+		req *StreamResumeRequest,
+		sender Sender,
+	) (abandoned bool, err error)
 }

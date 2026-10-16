@@ -36,11 +36,64 @@ message SearchResponse {
 message StreamSearchRequest {
   reserved 1 to 2;
   SearchRequest request = 3;
+
+  // Opaque credential returned by a previous StreamSearchResponse. When set,
+  // the server resumes from the last confirmed batch of the snapshot instead
+  // of starting a new search. The request must echo the original query and
+  // options so the server can verify they match the snapshot.
+  bytes resume_token = 4;
+
+  // When true, resume_token identifies a snapshot to release instead of a
+  // search to resume. The server releases the snapshot and acknowledges with
+  // snapshot_abandoned on the terminal response.
+  bool abandon_snapshot = 5;
 }
 
 message StreamSearchResponse {
   reserved 1 to 5;
   SearchResponse response_chunk = 6;
+
+  // Opaque resumption credential attached to the final message of each
+  // safely confirmable batch. Receiving this message confirms every file in
+  // that batch and all preceding batches. A disconnect inside a batch leaves
+  // the client with the previous token, so the whole unconfirmed batch is
+  // re-sent on resume.
+  bytes resume_token = 7;
+
+  // Set only on a terminal response (response_chunk unset) when a resume
+  // request could not be honored. The server never silently starts a new
+  // search in this case; the client must resubmit the query if it wants a
+  // fresh result set.
+  StreamResumeError resume_error = 8;
+
+  // True on the terminal response acknowledging an abandon_snapshot request.
+  bool snapshot_abandoned = 9;
+}
+
+// StreamResumeError explains why a resume request could not be honored.
+enum StreamResumeError {
+  STREAM_RESUME_ERROR_UNSPECIFIED = 0;
+
+  // The credential is malformed, corrupt, forged, or its HMAC does not
+  // verify.
+  STREAM_RESUME_ERROR_INVALID_TOKEN = 1;
+
+  // The credential is valid but the echoed query, SearchOptions, or tenant
+  // do not match the ones fixed by the snapshot.
+  STREAM_RESUME_ERROR_MISMATCH = 2;
+
+  // The snapshot has passed its expiration time.
+  STREAM_RESUME_ERROR_EXPIRED = 3;
+
+  // The credential was produced by another server process (e.g. the server
+  // restarted) or references a snapshot that no longer exists.
+  STREAM_RESUME_ERROR_RESTARTED = 4;
+
+  // The snapshot already completed the full result stream.
+  STREAM_RESUME_ERROR_COMPLETED = 5;
+
+  // The snapshot was explicitly abandoned by the client.
+  STREAM_RESUME_ERROR_ABANDONED = 6;
 }
 
 message SearchOptions {

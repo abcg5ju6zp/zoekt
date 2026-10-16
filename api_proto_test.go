@@ -142,6 +142,8 @@ func TestProtoRoundtrip(t *testing.T) {
 				if f1 != nil {
 					repoURLs = f1.RepoURLs
 					lineFragments = f1.LineFragments
+					// ResumeToken is carried only on StreamSearchResponse.
+					f1.ResumeToken = nil
 				}
 
 				p1 := f1.ToProto()

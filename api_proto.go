@@ -355,7 +355,9 @@ func SearchResultFromStreamProto(p *webserverv1.StreamSearchResponse, repoURLs, 
 		return nil
 	}
 
-	return SearchResultFromProto(p.GetResponseChunk(), repoURLs, lineFragments)
+	sr := SearchResultFromProto(p.GetResponseChunk(), repoURLs, lineFragments)
+	sr.ResumeToken = p.GetResumeToken()
+	return sr
 }
 
 func SearchResultFromProto(p *webserverv1.SearchResponse, repoURLs, lineFragments map[string]string) *SearchResult {
@@ -402,7 +404,10 @@ func (sr *SearchResult) ToStreamProto() *webserverv1.StreamSearchResponse {
 		return nil
 	}
 
-	return &webserverv1.StreamSearchResponse{ResponseChunk: sr.ToProto()}
+	return &webserverv1.StreamSearchResponse{
+		ResponseChunk: sr.ToProto(),
+		ResumeToken:   sr.ResumeToken,
+	}
 }
 
 func RepositoryBranchFromProto(p *webserverv1.RepositoryBranch) RepositoryBranch {

@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/internal/tenant"
@@ -62,6 +63,47 @@ func (s *typeRepoSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 	}
 
 	return s.Streamer.StreamSearch(ctx, q, opts, zoekt.SenderFunc(func(event *zoekt.SearchResult) {
+		stats.Add(event.Stats)
+		sender.Send(event)
+	}))
+}
+
+// StreamSearchResume implements zoekt.ResumableStreamer. type:repo
+// sub-queries are evaluated first (against the currently loaded shards), so
+// the snapshot sees the same resolved query on every call; a type:repo query
+// whose resolution changes across calls is therefore rejected as a mismatch.
+func (s *typeRepoSearcher) StreamSearchResume(
+	ctx context.Context,
+	q query.Q,
+	opts *zoekt.SearchOptions,
+	req *zoekt.StreamResumeRequest,
+	sender zoekt.Sender,
+) (abandoned bool, err error) {
+	tr, ctx := trace.New(ctx, "typeRepoSearcher.StreamSearchResume", "")
+	tr.LazyLog(q, true)
+	tr.LazyPrintf("opts: %+v", opts)
+	tenant.Log(ctx, tr)
+	var stats zoekt.Stats
+	defer func() {
+		tr.LazyPrintf("stats: %+v", stats)
+		if err != nil {
+			tr.LazyPrintf("error: %v", err)
+			tr.SetError(err)
+		}
+		tr.Finish()
+	}()
+
+	q, err = s.eval(ctx, tr, q)
+	if err != nil {
+		return false, err
+	}
+
+	inner, ok := s.Streamer.(zoekt.ResumableStreamer)
+	if !ok {
+		return false, fmt.Errorf("%T does not support resumable streaming", s.Streamer)
+	}
+
+	return inner.StreamSearchResume(ctx, q, opts, req, zoekt.SenderFunc(func(event *zoekt.SearchResult) {
 		stats.Add(event.Stats)
 		sender.Send(event)
 	}))

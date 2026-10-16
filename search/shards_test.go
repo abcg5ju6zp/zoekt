@@ -1119,7 +1119,7 @@ func TestSendByRepository(t *testing.T) {
 		sr := createMockSearchResult(n1, n2, n3, wantStats)
 
 		mock := &mockSender{}
-		sendByRepository(sr, &zoekt.SearchOptions{}, mock)
+		sendByRepository(sr, &zoekt.SearchOptions{}, mock, nil)
 
 		if diff := cmp.Diff(wantStats, mock.stats); diff != "" {
 			t.Logf("-want,+got\n%s", diff)

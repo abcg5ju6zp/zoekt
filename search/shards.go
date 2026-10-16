@@ -193,6 +193,84 @@ type rankedShard struct {
 	//
 	// repos is nil only if that call failed.
 	repos []*zoekt.Repository
+
+	// Lifecycle references. A shard that is present in the shardedSearcher map
+	// or held by an in-flight request or resume snapshot is pinned. replace
+	// retires superseded shards; a retired shard is closed only when its last
+	// pin is released.
+	refs    atomic.Int32
+	removed atomic.Bool
+
+	closeOnce sync.Once
+}
+
+// pin registers an active reference to the shard. It returns false if the
+// shard was already retired and its underlying Searcher closed (or is about to
+// be); callers must not use the shard in that case.
+func (r *rankedShard) pin() bool {
+	r.refs.Add(1)
+	if r.removed.Load() {
+		r.unpin()
+		return false
+	}
+	return true
+}
+
+// unpin releases a reference previously taken with pin. When the retired
+// shard reaches zero references its underlying Searcher is closed.
+func (r *rankedShard) unpin() {
+	if r.refs.Add(-1) == 0 && r.removed.Load() {
+		r.close()
+	}
+}
+
+// retire removes the shard from service. It is closed immediately when it has
+// no pins, otherwise the close happens when the last pin is released.
+func (r *rankedShard) retire() {
+	r.removed.Store(true)
+	if r.refs.Load() == 0 {
+		r.close()
+	}
+}
+
+func (r *rankedShard) close() {
+	r.closeOnce.Do(func() {
+		r.Searcher.Close()
+	})
+}
+
+// pinShards pins every shard and returns the pinned slice together with a
+// release function. If any shard was retired concurrently by replace, the
+// attempt is retried once against the newest loaded set, since such a shard
+// may already be closed.
+func (ss *shardedSearcher) pinShards(shards []*rankedShard) ([]*rankedShard, func()) {
+	pinAll := func(candidates []*rankedShard) ([]*rankedShard, bool) {
+		pinned := make([]*rankedShard, 0, len(candidates))
+		for _, r := range candidates {
+			if !r.pin() {
+				for _, p := range pinned {
+					p.unpin()
+				}
+				return nil, false
+			}
+			pinned = append(pinned, r)
+		}
+		return pinned, true
+	}
+
+	pinned, ok := pinAll(shards)
+	if !ok {
+		fresh := ss.getLoaded()
+		shards = fresh.shards
+		pinned, _ = pinAll(shards)
+	}
+
+	unpinAll := func() {
+		for _, r := range pinned {
+			r.unpin()
+		}
+	}
+	return pinned, unpinAll
 }
 
 // loaded stores the state we compute when updating the state of shards from
@@ -214,6 +292,10 @@ type shardedSearcher struct {
 	// pressure.
 	sched scheduler
 
+	// snapshots owns the resumable StreamSearch snapshots and their pinned
+	// shards.
+	snapshots *snapshotRegistry
+
 	mu     sync.Mutex // protects writes to shards
 	shards map[string]*rankedShard
 
@@ -223,8 +305,9 @@ type shardedSearcher struct {
 
 func newShardedSearcher(n int64) *shardedSearcher {
 	ss := &shardedSearcher{
-		shards: make(map[string]*rankedShard),
-		sched:  newScheduler(n),
+		shards:    make(map[string]*rankedShard),
+		sched:     newScheduler(n),
+		snapshots: newSnapshotRegistry(),
 	}
 	return ss
 }
@@ -328,10 +411,42 @@ func (s *readySearcher) Ready() bool {
 	return s.ready.Ready()
 }
 
+// StreamSearchResume forwards to the underlying resumable streamer so that the
+// searcher returned by NewDirectorySearcher(Fast) implements
+// zoekt.ResumableStreamer.
+func (s *readySearcher) StreamSearchResume(
+	ctx context.Context,
+	q query.Q,
+	opts *zoekt.SearchOptions,
+	req *zoekt.StreamResumeRequest,
+	sender zoekt.Sender,
+) (bool, error) {
+	inner, ok := s.Streamer.(zoekt.ResumableStreamer)
+	if !ok {
+		return false, fmt.Errorf("%T does not support resumable streaming", s.Streamer)
+	}
+	return inner.StreamSearchResume(ctx, q, opts, req, sender)
+}
+
 type directorySearcher struct {
 	zoekt.Streamer
 
 	directoryWatcher *DirectoryWatcher
+}
+
+// StreamSearchResume forwards to the underlying resumable (sharded) searcher.
+func (s *directorySearcher) StreamSearchResume(
+	ctx context.Context,
+	q query.Q,
+	opts *zoekt.SearchOptions,
+	req *zoekt.StreamResumeRequest,
+	sender zoekt.Sender,
+) (bool, error) {
+	inner, ok := s.Streamer.(zoekt.ResumableStreamer)
+	if !ok {
+		return false, fmt.Errorf("%T does not support resumable streaming", s.Streamer)
+	}
+	return inner.StreamSearchResume(ctx, q, opts, req, sender)
 }
 
 func (s *directorySearcher) Close() {
@@ -424,6 +539,8 @@ func (ss *shardedSearcher) String() string {
 
 // Close closes references to open files. It may be called only once.
 func (ss *shardedSearcher) Close() {
+	ss.snapshots.closeAll()
+
 	ss.mu.Lock()
 	shards := make(map[string]zoekt.Searcher, len(ss.shards))
 	for k := range ss.shards {
@@ -874,7 +991,9 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	start = time.Now()
 
 	loaded := ss.getLoaded()
-	done, err := streamSearch(ctx, proc, q, opts, loaded.shards, collectSender)
+	shards, releaseShards := ss.pinShards(loaded.shards)
+	defer releaseShards()
+	done, err := streamSearch(ctx, proc, q, opts, shards, collectSender, nil)
 	defer done()
 	if err != nil {
 		return nil, err
@@ -901,7 +1020,81 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	return aggregate, nil
 }
 
+// StreamSearch implements zoekt.Streamer. This is the legacy non-resumable
+// entry point; it behaves exactly as before and never creates a snapshot.
 func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zoekt.SearchOptions, sender zoekt.Sender) (err error) {
+	return ss.runStreamSearch(ctx, q, opts, sender, nil, nil)
+}
+
+// StreamSearchResume implements zoekt.ResumableStreamer. An empty token starts
+// a snapshot-backed stream; a non-empty token either resumes or abandons the
+// identified snapshot. A non-resumable credential is reported as
+// *zoekt.StreamResumeError without running a search.
+func (ss *shardedSearcher) StreamSearchResume(
+	ctx context.Context,
+	q query.Q,
+	opts *zoekt.SearchOptions,
+	req *zoekt.StreamResumeRequest,
+	sender zoekt.Sender,
+) (abandoned bool, err error) {
+	tenantID := tenantIDFromContext(ctx)
+
+	if req != nil && len(req.Token) > 0 {
+		if req.Abandon {
+			if rerr := ss.snapshots.abandon(req.Token, q, opts, tenantID); rerr != nil {
+				return false, rerr
+			}
+			return true, nil
+		}
+
+		view, rerr := ss.snapshots.resume(req.Token, q, opts, tenantID)
+		if rerr != nil {
+			return false, rerr
+		}
+		if !view.snapshot.beginCall(ctx) {
+			return false, resumeError(zoekt.StreamResumeInvalidToken, "snapshot is not resumable in its current state")
+		}
+		defer view.snapshot.endCall()
+
+		return false, ss.runStreamSearch(ctx, q, opts, sender, view.snapshot, view)
+	}
+
+	if req != nil && req.Abandon {
+		return false, resumeError(zoekt.StreamResumeInvalidToken, "abandon requires a resume token")
+	}
+
+	snap, rerr := ss.newSearchSnapshot(ctx, q, opts)
+	if rerr != nil {
+		return false, rerr
+	}
+	if !snap.beginCall(ctx) {
+		return false, resumeError(zoekt.StreamResumeInvalidToken, "snapshot is not resumable in its current state")
+	}
+	defer snap.endCall()
+
+	if err := ss.runStreamSearch(ctx, q, opts, sender, snap, nil); err != nil {
+		// Keep the snapshot on error / disconnect so the client can resume;
+		// it is released by completion, explicit abandon or TTL expiry.
+		return false, err
+	}
+	ss.snapshots.finish(snap)
+	return false, nil
+}
+
+// runStreamSearch contains the shared StreamSearch implementation. snap is nil
+// for the legacy path. For the resumable path, view is nil on the first call
+// and non-nil on a resume (it carries the confirmed batches and match seed).
+func (ss *shardedSearcher) runStreamSearch(
+	ctx context.Context,
+	q query.Q,
+	opts *zoekt.SearchOptions,
+	sender zoekt.Sender,
+	snap *searchSnapshot,
+	view *resumeView,
+) (err error) {
+	if opts == nil {
+		opts = &zoekt.SearchOptions{}
+	}
 	tr, ctx := trace.New(ctx, "shardedSearcher.StreamSearch", "")
 	defer func() {
 		if err != nil {
@@ -919,29 +1112,48 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 	defer proc.Release()
 	tr.LazyPrintf("acquired process")
 
-	loaded := ss.getLoaded()
-	shards := loaded.shards
-
-	maxPendingPriority := math.Inf(-1)
-	if len(shards) > 0 {
-		maxPendingPriority = shards[0].priority
+	var (
+		shards        []*rankedShard
+		releaseShards func()
+		ready         bool
+	)
+	if snap == nil {
+		loaded := ss.getLoaded()
+		shards, releaseShards = ss.pinShards(loaded.shards)
+		defer releaseShards()
+		ready = loaded.ready
+	} else {
+		// Snapshot shards are pinned for the snapshot lifetime; runStreamSearch
+		// takes no extra pin.
+		shards = snap.shards
+		ready = snap.ready
 	}
 
-	stillLoadingCrashes := 0
-	if !loaded.ready {
-		// We may have missed results due to not being fully loaded.
-		stillLoadingCrashes++
-	}
+	// The initial stats-only event belongs to the first call only: on resume it
+	// was already delivered before any batch token, so replaying it would
+	// double-count Wait/Crashes for the client.
+	if view == nil {
+		maxPendingPriority := math.Inf(-1)
+		if len(shards) > 0 {
+			maxPendingPriority = shards[0].priority
+		}
 
-	sender.Send(&zoekt.SearchResult{
-		Stats: zoekt.Stats{
-			Crashes: stillLoadingCrashes,
-			Wait:    time.Since(start),
-		},
-		Progress: zoekt.Progress{
-			MaxPendingPriority: maxPendingPriority,
-		},
-	})
+		stillLoadingCrashes := 0
+		if !ready {
+			// We may have missed results due to not being fully loaded.
+			stillLoadingCrashes++
+		}
+
+		sender.Send(&zoekt.SearchResult{
+			Stats: zoekt.Stats{
+				Crashes: stillLoadingCrashes,
+				Wait:    time.Since(start),
+			},
+			Progress: zoekt.Progress{
+				MaxPendingPriority: maxPendingPriority,
+			},
+		})
+	}
 
 	// Matches flow from the shards up the stack in the following order:
 	//
@@ -953,16 +1165,34 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 	// For streaming, the wrapping has to happen in the inverted order.
 	sender = copyFileSender(sender)
 
-	if truncator, hasLimits := index.NewDisplayTruncator(opts); hasLimits {
+	if snap != nil {
+		// The snapshot keeps the stateful display truncator across runs so
+		// display limits behave as in an uninterrupted stream.
+		if truncator := snap.displayTruncator(opts); snap.displayLimits() {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithCancel(ctx)
+			defer cancel()
+			sender = limitSender(cancel, sender, truncator)
+		}
+	} else if truncator, limits := index.NewDisplayTruncator(opts); limits {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
 		defer cancel()
 		sender = limitSender(cancel, sender, truncator)
 	}
 
-	sender, flush := newFlushCollectSender(opts, sender)
+	var (
+		resume    *resumeExec
+		committer *batchCommitter
+	)
+	if snap != nil {
+		committer = newBatchCommitter(snap, opts.FlushWallTime > 0)
+		resume = newResumeExec(snap, view, committer.emitted)
+	}
 
-	done, err := streamSearch(ctx, proc, q, opts, shards, sender)
+	sender, flush := newFlushCollectSender(opts, sender, committer)
+
+	done, err := streamSearch(ctx, proc, q, opts, shards, sender, resume)
 
 	// Even though streaming is done, we may have results sitting in a buffer we
 	// need to flush. So we need to send those before calling done.
@@ -970,6 +1200,42 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 	done()
 
 	return err
+}
+
+// resumeExec is the per-run resumable state passed into streamSearch.
+type resumeExec struct {
+	snap      *searchSnapshot
+	keyOf     map[*rankedShard]string
+	confirmed map[string]bool
+
+	// commit records a finished shard batch and returns the credential
+	// confirming it, honoring the FlushWallTime collect window via the
+	// batchCommitter.
+	commit func(key string, matchCount int) []byte
+
+	// seedMatchCount is the sum of MatchCount of confirmed batches, used to
+	// initialize TotalMaxMatchCount accounting on resume.
+	seedMatchCount int
+	// limitHit is true when TotalMaxMatchCount stopped dispatch on a previous
+	// run; remaining shards must not be dispatched again.
+	limitHit bool
+}
+
+func newResumeExec(snap *searchSnapshot, view *resumeView, commit func(key string, matchCount int) []byte) *resumeExec {
+	keyOf := make(map[*rankedShard]string, len(snap.shards))
+	for i, s := range snap.shards {
+		keyOf[s] = snap.keys[i]
+	}
+
+	re := &resumeExec{snap: snap, keyOf: keyOf, confirmed: map[string]bool{}, commit: commit}
+	if view != nil {
+		for _, b := range view.confirmed {
+			re.confirmed[b.key] = true
+		}
+		re.seedMatchCount = view.totalMatch
+		re.limitHit = view.limitHit
+	}
+	return re
 }
 
 func schedulingClass(opts *zoekt.SearchOptions) zoekt.SchedulingClass {
@@ -987,7 +1253,24 @@ func schedulingClass(opts *zoekt.SearchOptions) zoekt.SchedulingClass {
 // collector can't see. Calling done informs the garbage collector it is free
 // to collect those shards. The caller must call copyFiles on any
 // SearchResults it returns/streams out before calling done.
-func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.SearchOptions, shards []*rankedShard, sender zoekt.Sender) (done func(), err error) {
+//
+// resume is nil for the legacy path. For a resumable stream it carries the
+// pinned snapshot, the confirmed batches to skip and the TotalMaxMatchCount
+// seed. After a shard result is fully emitted, batchToken records the batch in
+// the snapshot and returns the credential confirming it (nil for the legacy
+// path).
+func streamSearch(
+	ctx context.Context,
+	proc *process,
+	q query.Q,
+	opts *zoekt.SearchOptions,
+	shards []*rankedShard,
+	sender zoekt.Sender,
+	resume *resumeExec,
+) (done func(), err error) {
+	if opts == nil {
+		opts = &zoekt.SearchOptions{}
+	}
 	tr, ctx := trace.New(ctx, "shardedSearcher.streamSearch", "")
 	overallStart := time.Now()
 	metricSearchRunning.Inc()
@@ -1011,11 +1294,34 @@ func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.Sea
 		tr.LazyPrintf("selectRepoSet shards=%d->%d q=%s->%s", beforeLen, len(shards), beforeQ, q)
 	}
 
+	// On resume, skip the shards whose batches were already confirmed.
+	if resume != nil {
+		filtered := make([]*rankedShard, 0, len(shards))
+		for _, s := range shards {
+			if !resume.confirmed[resume.keyOf[s]] {
+				filtered = append(filtered, s)
+			}
+		}
+		shards = filtered
+
+		// The previous run already stopped dispatching new shards because of
+		// TotalMaxMatchCount; an uninterrupted stream would not have searched
+		// the remaining shards either.
+		if resume.limitHit {
+			return func() {}, nil
+		}
+	}
+
 	if len(shards) == 0 {
 		return func() {}, nil
 	}
 
 	var cancel context.CancelFunc
+	// parentCtx is the caller's context before per-search cancellation is
+	// added. It lets the dispatch loop notice a client disconnect (which must
+	// stop new shard dispatch) without treating the internal display-limit
+	// cancel as an error.
+	parentCtx := ctx
 	if opts.MaxWallTime == 0 {
 		ctx, cancel = context.WithCancel(ctx)
 	} else {
@@ -1030,6 +1336,7 @@ func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.Sea
 
 	type result struct {
 		priority float64
+		shard    *rankedShard
 		*zoekt.SearchResult
 		err error
 	}
@@ -1054,7 +1361,7 @@ func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.Sea
 			defer wg.Done()
 			for s := range search {
 				sr, err := searchOneShard(ctx, s, q, opts)
-				r := &result{priority: s.priority, SearchResult: sr, err: err}
+				r := &result{priority: s.priority, shard: s, SearchResult: sr, err: err}
 				results <- r
 			}
 		}()
@@ -1084,8 +1391,17 @@ func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.Sea
 		}
 	}
 
-	// tracked so we can stop when we hit TotalMaxMatchCount
-	var totalMatchCount int
+	// tracked so we can stop when we hit TotalMaxMatchCount; seeded with the
+	// matches already confirmed on previous runs when resuming.
+	totalMatchCount := 0
+	if resume != nil {
+		totalMatchCount = resume.seedMatchCount
+	}
+
+	// parentDone is set once the caller's context is canceled; in-flight
+	// results are still drained but no longer emitted or committed to a
+	// snapshot (the client cannot have received them).
+	parentDone := false
 
 search:
 	for {
@@ -1093,7 +1409,29 @@ search:
 		// to possibly allow other searches to make progress
 		_ = proc.Yield(ctx) // Note: we let searchOneShard handle context errors
 
+		// Prefer the caller cancellation over a result that is already
+		// buffered: once the client is gone we must never dispatch another
+		// shard or emit a new batch, we only drain.
+		if parentCtx.Err() != nil {
+			stop()
+			if !parentDone {
+				parentDone = true
+				if err == nil {
+					err = parentCtx.Err()
+				}
+			}
+		}
+
 		select {
+		case <-parentCtx.Done():
+			// Client disconnect (or caller cancellation): stop dispatching
+			// new shards and surface the error so a resumable snapshot stays
+			// open.
+			stop()
+			parentDone = true
+			if err == nil {
+				err = parentCtx.Err()
+			}
 		case work <- next: // is there a worker available to search the next shard?
 			pending.append(next.priority)
 
@@ -1119,11 +1457,22 @@ search:
 				continue
 			}
 
+			// Drain results produced before the caller canceled; they are
+			// neither sent nor recorded as confirmed.
+			if parentDone {
+				continue
+			}
+
 			// Update the match count statistics and stop searching new shards if we've
 			// reached the limit set in the options.
 			totalMatchCount += r.MatchCount
 			if opts.TotalMaxMatchCount > 0 && totalMatchCount > opts.TotalMaxMatchCount {
 				stop()
+				if resume != nil {
+					// Remember the limit across resumes so remaining shards are not
+					// dispatched again.
+					resume.snap.setTotalMatchLimitHit()
+				}
 			}
 
 			observeMetrics(r.SearchResult)
@@ -1131,7 +1480,17 @@ search:
 			r.Priority = r.priority
 			r.MaxPendingPriority = pending.max()
 
-			sendByRepository(r.SearchResult, opts, sender) // send the result back to the client
+			// The batch credential is minted once, only on the final event of
+			// the shard batch (see sendByRepository).
+			var batchToken func() []byte
+			if resume != nil {
+				key := resume.keyOf[r.shard]
+				batchToken = func() []byte {
+					return resume.commit(key, r.MatchCount)
+				}
+			}
+
+			sendByRepository(r.SearchResult, opts, sender, batchToken) // send the result back to the client
 		}
 	}
 
@@ -1144,14 +1503,21 @@ search:
 //
 // We split by repository instead of by priority because it is easier to set
 // RepoURLs and LineFragments in zoekt.SearchResult.
-func sendByRepository(result *zoekt.SearchResult, opts *zoekt.SearchOptions, sender zoekt.Sender) {
+//
+// batchToken, when non-nil, is invoked once and the resulting resume
+// credential is attached to the final event of the shard batch (so receiving
+// the event guarantees every earlier event of the batch was received).
+func sendByRepository(result *zoekt.SearchResult, opts *zoekt.SearchOptions, sender zoekt.Sender, batchToken func() []byte) {
 	if len(result.RepoURLs) <= 1 || len(result.Files) == 0 {
 		index.SortFiles(result.Files)
+		if batchToken != nil {
+			result.ResumeToken = batchToken()
+		}
 		sender.Send(result)
 		return
 	}
 
-	send := func(repoName string, a, b int, stats zoekt.Stats) {
+	send := func(repoName string, a, b int, stats zoekt.Stats, attachToken bool) {
 		index.SortFiles(result.Files[a:b])
 
 		filteredRepoURLs := map[string]string{repoName: result.RepoURLs[repoName]}
@@ -1176,7 +1542,7 @@ func sendByRepository(result *zoekt.SearchResult, opts *zoekt.SearchOptions, sen
 			}
 		}
 
-		sender.Send(&zoekt.SearchResult{
+		out := &zoekt.SearchResult{
 			Stats: stats,
 			Progress: zoekt.Progress{
 				Priority:           result.Files[a].RepositoryPriority,
@@ -1185,7 +1551,11 @@ func sendByRepository(result *zoekt.SearchResult, opts *zoekt.SearchOptions, sen
 			Files:         result.Files[a:b],
 			RepoURLs:      filteredRepoURLs,
 			LineFragments: filteredLineFragments,
-		})
+		}
+		if attachToken && batchToken != nil {
+			out.ResumeToken = batchToken()
+		}
+		sender.Send(out)
 	}
 
 	var startIndex, endIndex int
@@ -1197,7 +1567,7 @@ func sendByRepository(result *zoekt.SearchResult, opts *zoekt.SearchOptions, sen
 		if curRepoID != fm.RepositoryID {
 			// Stats must stay aggregate-able, hence we sent the aggregate stats with the
 			// last event.
-			send(curRepoName, startIndex, endIndex, zoekt.Stats{})
+			send(curRepoName, startIndex, endIndex, zoekt.Stats{}, false)
 
 			startIndex = endIndex
 			curRepoID = fm.RepositoryID
@@ -1205,7 +1575,7 @@ func sendByRepository(result *zoekt.SearchResult, opts *zoekt.SearchOptions, sen
 		}
 	}
 
-	send(curRepoName, startIndex, endIndex+1, result.Stats)
+	send(curRepoName, startIndex, endIndex+1, result.Stats, true)
 }
 
 func observeMetrics(sr *zoekt.SearchResult) {
@@ -1333,7 +1703,8 @@ func (ss *shardedSearcher) List(ctx context.Context, q query.Q, opts *zoekt.List
 	tr.LazyPrintf("acquired process")
 
 	loaded := ss.getLoaded()
-	shards := loaded.shards
+	shards, releaseShards := ss.pinShards(loaded.shards)
+	defer releaseShards()
 
 	// Setup what we return now, since we may short circuit if there are no
 	// shards to search.
@@ -1527,30 +1898,13 @@ func (s *shardedSearcher) replace(shards map[string]zoekt.Searcher) {
 		}
 
 		if old != nil && old.Searcher != nil {
-			//                 _ ___                /^^\ /^\  /^^\_
-			//     _          _@)@) \            ,,/ '` ~ `'~~ ', `\.
-			//   _/o\_ _ _ _/~`.`...'~\        ./~~..,'`','',.,' '  ~:
-			//  / `,'.~,~.~  .   , . , ~|,   ,/ .,' , ,. .. ,,.   `,  ~\_
-			// ( ' _' _ '_` _  '  .    , `\_/ .' ..' '  `  `   `..  `,   \_
-			//  ~V~ V~ V~ V~ ~\ `   ' .  '    , ' .,.,''`.,.''`.,.``. ',   \_
-			//   _/\ /\ /\ /\_/, . ' ,   `_/~\_ .' .,. ,, , _/~\_ `. `. '.,  \_
-			//  < ~ ~ '~`'~'`, .,  .   `_: ::: \_ '      `_/ ::: \_ `.,' . ',  \_
-			//   \ ' `_  '`_    _    ',/ _::_::_ \ _    _/ _::_::_ \   `.,'.,`., \-,-,-,_,_,
-			//    `'~~ `'~~ `'~~ `'~~  \(_)(_)(_)/  `~~' \(_)(_)(_)/ ~'`\_.._,._,'_;_;_;_;_;
-			//
-			// We can't just call Close now, because there may be ongoing searches
-			// which have old in the shards list. Previously we used an exclusive
-			// lock to guarantee there were no concurrent searches. However, that
-			// led to blocking on the read path.
-			//
-			// We could introduce granular locking per rankedShard to know when
-			// there are no more references. However, this becomes tricky in
-			// practice. Instead we rely on the garbage collector noticing old is no
-			// longer used. We take care in our searchers to runtime.KeepAlive until
-			// we have stopped referencing the underling mmap data.
-			runtime.SetFinalizer(old, func(r *rankedShard) {
-				r.Close()
-			})
+			// We can't just call Close now, because there may be ongoing
+			// searches which hold old in their (pinned) shard list, as well
+			// as resume snapshots that pinned the old generation. retire marks
+			// the shard as removed and closes it immediately if it has no
+			// pins; otherwise the last unpin (search done or snapshot
+			// released/expired) closes it deterministically.
+			old.retire()
 		}
 	}
 

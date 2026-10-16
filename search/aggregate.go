@@ -93,7 +93,13 @@ func (c *collectSender) hasDisplayLimit() bool {
 // newFlushCollectSender creates a sender which will collect and rank results
 // until opts.FlushWallTime. After that it will stream each result as it is
 // sent.
-func newFlushCollectSender(opts *zoekt.SearchOptions, sender zoekt.Sender) (zoekt.Sender, func()) {
+//
+// committer, when non-nil, coordinates resumable batch confirmation: batches
+// that arrive while collecting are held back by the committer and only
+// committed (minted into a credential) when the aggregated result flushes, so
+// a disconnect inside the collect window never confirms batches the client did
+// not receive.
+func newFlushCollectSender(opts *zoekt.SearchOptions, sender zoekt.Sender, committer *batchCommitter) (zoekt.Sender, func()) {
 	// We don't need to do any collecting, so just pass back the sender to use
 	// directly.
 	if opts.FlushWallTime == 0 {
@@ -124,7 +130,14 @@ func newFlushCollectSender(opts *zoekt.SearchOptions, sender zoekt.Sender) (zoek
 		if agg, ok := collectSender.Done(); ok {
 			metricFinalAggregateSize.WithLabelValues(reason.String()).Observe(float64(len(agg.Files)))
 			agg.FlushReason = reason
+			if committer != nil {
+				// The aggregate is one wire-level batch boundary: confirm
+				// every shard batch collected inside the window only now.
+				agg.ResumeToken = committer.flush()
+			}
 			sender.Send(agg)
+		} else if committer != nil {
+			committer.flush()
 		}
 
 		// From now on use sender directly
@@ -158,6 +171,56 @@ func newFlushCollectSender(opts *zoekt.SearchOptions, sender zoekt.Sender) (zoek
 		}
 		mu.Unlock()
 	}), finalFlush
+}
+
+// batchCommitter gates resumable batch credentials on actual delivery to the
+// sender. While flushCollectSender is collecting (FlushWallTime window) the
+// batch results are not yet deliverable, so their confirmation is deferred;
+// flush commits the deferred batches as one confirmation point. Outside of a
+// collecting window every batch commits immediately.
+type batchCommitter struct {
+	snap *searchSnapshot
+
+	mu         sync.Mutex
+	collecting bool
+	pending    []emittedBatch
+}
+
+func newBatchCommitter(snap *searchSnapshot, collecting bool) *batchCommitter {
+	return &batchCommitter{snap: snap, collecting: collecting}
+}
+
+// emitted is called when streamSearch finishes emitting one shard batch. It
+// returns the credential confirming the batch (nil while collecting, or when
+// there is no snapshot).
+func (c *batchCommitter) emitted(key string, matchCount int) []byte {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.collecting {
+		c.pending = append(c.pending, emittedBatch{key: key, matchCount: matchCount})
+		return nil
+	}
+	return c.snap.recordBatch(key, matchCount)
+}
+
+// flush commits all deferred batches and returns a credential for the last
+// one, confirming the whole aggregated delivery.
+func (c *batchCommitter) flush() []byte {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.collecting = false
+	var token []byte
+	for _, b := range c.pending {
+		token = c.snap.recordBatch(b.key, b.matchCount)
+	}
+	c.pending = c.pending[:0]
+	return token
 }
 
 // limitSender wraps a sender and calls cancel once the truncator has finished
